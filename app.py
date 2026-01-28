@@ -54,11 +54,11 @@ def init_db():
     if c.fetchone()[0] == 0:
         c.execute('INSERT INTO usuarios VALUES (?, ?, ?)', ('admin', make_hashes('admin123'), 'admin'))
     
-    # Tabela Funções
+    # Tabela Funções (AGORA COM DONO)
     c.execute('''CREATE TABLE IF NOT EXISTS funcoes 
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT, nome TEXT, valor_hora REAL)''')
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, nome TEXT, valor_hora REAL, usuario_criador TEXT)''')
     
-    # Tabela Atendimentos (Completa)
+    # Tabela Atendimentos
     c.execute('''CREATE TABLE IF NOT EXISTS atendimentos 
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, inicio TEXT, termino TEXT, 
                   funcao TEXT, valor_total REAL, usuario_responsavel TEXT, detalhes TEXT,
@@ -66,18 +66,31 @@ def init_db():
     conn.commit()
     conn.close()
     
-    # Garante migração de versões antigas
     atualizar_banco_legado()
 
 def atualizar_banco_legado():
     conn = sqlite3.connect('atendimentos.db')
     c = conn.cursor()
-    colunas_novas = {'usuario_responsavel': 'TEXT', 'detalhes': 'TEXT', 'paciente': 'TEXT', 'periodo': 'TEXT'}
-    for col, tipo in colunas_novas.items():
+    
+    # Atualiza Atendimentos
+    colunas_novas_atend = {'usuario_responsavel': 'TEXT', 'detalhes': 'TEXT', 'paciente': 'TEXT', 'periodo': 'TEXT'}
+    for col, tipo in colunas_novas_atend.items():
         try: pd.read_sql(f'SELECT {col} FROM atendimentos LIMIT 1', conn)
         except: 
             try: c.execute(f'ALTER TABLE atendimentos ADD COLUMN {col} {tipo}'); conn.commit()
             except: pass
+            
+    # Atualiza Funções (Adiciona dono para funções antigas)
+    try:
+        pd.read_sql('SELECT usuario_criador FROM funcoes LIMIT 1', conn)
+    except:
+        try: 
+            # Cria a coluna e define 'admin' como dono das funções antigas para não sumirem
+            c.execute('ALTER TABLE funcoes ADD COLUMN usuario_criador TEXT')
+            c.execute("UPDATE funcoes SET usuario_criador = 'admin' WHERE usuario_criador IS NULL")
+            conn.commit()
+        except: pass
+
     conn.close()
 
 # --- LÓGICA DE PERÍODO ---
@@ -184,16 +197,30 @@ def excluir_usuario(username):
     c.execute('DELETE FROM usuarios WHERE username = ?', (username,))
     conn.commit(); conn.close()
 
+# --- MODIFICADO: CARREGAR FUNÇÕES AGORA FILTRA POR DONO ---
 def carregar_funcoes():
     conn = sqlite3.connect('atendimentos.db')
-    df = pd.read_sql('SELECT * FROM funcoes', conn)
-    conn.close()
+    try:
+        if st.session_state.get('tipo') == 'admin':
+            query = 'SELECT * FROM funcoes'
+            df = pd.read_sql(query, conn)
+        else:
+            # Usuário comum só vê as suas próprias funções
+            query = 'SELECT * FROM funcoes WHERE usuario_criador = ?'
+            df = pd.read_sql(query, conn, params=(st.session_state.get('usuario'),))
+    except: df = pd.DataFrame()
+    finally: conn.close()
+    
+    if 'usuario_criador' not in df.columns and not df.empty:
+        df['usuario_criador'] = 'admin'
+        
     return df
 
-def salvar_funcao(nome, valor):
+# --- MODIFICADO: SALVAR FUNÇÃO COM O DONO ---
+def salvar_funcao(nome, valor, usuario_criador):
     conn = sqlite3.connect('atendimentos.db')
     c = conn.cursor()
-    c.execute('INSERT INTO funcoes (nome, valor_hora) VALUES (?, ?)', (nome, valor))
+    c.execute('INSERT INTO funcoes (nome, valor_hora, usuario_criador) VALUES (?, ?, ?)', (nome, valor, usuario_criador))
     conn.commit(); conn.close()
 
 def atualizar_funcao_db(id_func, nome, valor):
@@ -299,9 +326,14 @@ else:
         st.session_state.update({'logado': False, 'usuario': None, 'tipo': None})
         st.rerun()
 
-    # TELA 01: FUNÇÕES
+    # TELA 01: FUNÇÕES (AGORA COM PRIVACIDADE)
     if menu == opcoes_menu["Funções"]:
         st.title("🛠️ Cadastro de Funções")
+        
+        # Mostra aviso se não houver funções
+        df_verificacao = carregar_funcoes()
+        if df_verificacao.empty:
+            st.info("💡 Você ainda não tem funções cadastradas. Cadastre a primeira abaixo.")
         
         tab1, tab2 = st.tabs(["Cadastrar Nova", "Editar/Excluir Existente"])
         
@@ -313,11 +345,15 @@ else:
                     valor = c2.number_input("Valor Hora (R$)", min_value=0.0, format="%.2f")
                     if st.form_submit_button("💾 Salvar"):
                         if nome and valor > 0:
-                            salvar_funcao(nome, valor)
-                            st.success(f"✅ '{nome}' cadastrado!")
-            st.subheader("📋 Funções Ativas")
+                            # Passa o usuário logado como dono
+                            salvar_funcao(nome, valor, st.session_state['usuario'])
+                            st.success(f"✅ '{nome}' cadastrado para {st.session_state['usuario']}!")
+            st.subheader("📋 Suas Funções Ativas")
+            # Recarrega para mostrar a nova
             df = carregar_funcoes()
-            if not df.empty: st.dataframe(df, hide_index=True, use_container_width=True)
+            if not df.empty: 
+                # Oculta coluna ID e Dono para ficar mais limpo na visualização
+                st.dataframe(df[['nome', 'valor_hora']], hide_index=True, use_container_width=True)
 
         with tab2:
             st.markdown("Selecione uma função para alterar o nome, valor ou excluir.")
@@ -358,9 +394,11 @@ else:
     # TELA 02: ATENDIMENTO
     elif menu == opcoes_menu["Atendimento"]:
         st.title("📝 Registrar Atendimento")
+        # Carrega APENAS as funções do usuário logado (ou todas se for admin)
         df_func = carregar_funcoes()
+        
         if df_func.empty:
-            st.warning("⚠️ Cadastre funções primeiro.")
+            st.warning("⚠️ Você ainda não tem funções cadastradas. Vá em 'Cadastro Função' primeiro.")
         else:
             with st.container(border=True):
                 c1, c2 = st.columns(2)
@@ -384,6 +422,7 @@ else:
                     elif dt_fim <= dt_ini: st.error("❌ Erro: Término deve ser depois do início.")
                     else:
                         duracao = (dt_fim - dt_ini).total_seconds() / 3600
+                        # Busca o valor da hora especificamente para a função selecionada
                         val_h = df_func.loc[df_func['nome'] == func, 'valor_hora'].values[0]
                         total = duracao * val_h
                         salvar_atendimento(dt_ini, dt_fim, func, total, st.session_state['usuario'], detalhes, nome_paciente, periodo_auto)
@@ -416,7 +455,6 @@ else:
                 row = df[df['id'] == id_selecionado].iloc[0]
                 
                 st.divider()
-                # AQUI ESTAVA O PROBLEMA: Substituído por st.warning nativo
                 st.warning(f"📝 **Editando Registro ID: {id_selecionado}** — Paciente: **{row['paciente']}**")
                 st.markdown("<br>", unsafe_allow_html=True)
 
@@ -430,26 +468,41 @@ else:
                     
                     novo_paciente = st.text_input("Paciente", value=row['paciente'])
                     
+                    # Carrega as funções do usuário para o selectbox de edição
                     lista_funcoes = df_func['nome'].tolist()
+                    
+                    # Tenta achar a função atual na lista. Se não achar (ex: foi excluída ou era de outro user), pega a primeira.
                     try: index_funcao = lista_funcoes.index(row['funcao'])
-                    except: index_funcao = 0
-                    nova_funcao = st.selectbox("Função", lista_funcoes, index=index_funcao)
+                    except: 
+                        index_funcao = 0
+                        # Se a lista estiver vazia (user sem funções), avisa
+                        if not lista_funcoes:
+                            st.error("Você precisa ter funções cadastradas para editar.")
+                    
+                    if lista_funcoes:
+                        nova_funcao = st.selectbox("Função", lista_funcoes, index=index_funcao)
+                    else:
+                        nova_funcao = None
+
                     novos_detalhes = st.text_area("Detalhes", value=row['detalhes'])
                     
                     btn_save = st.form_submit_button("💾 Salvar Alterações")
                 
                 if btn_save:
-                    dt_ini = datetime.combine(novo_d_ini, novo_h_ini)
-                    dt_fim = datetime.combine(novo_d_fim, novo_h_fim)
-                    if dt_fim <= dt_ini: st.error("Erro: Data fim menor que início.")
+                    if not nova_funcao:
+                        st.error("Impossível salvar sem uma função válida.")
                     else:
-                        duracao = (dt_fim - dt_ini).total_seconds() / 3600
-                        val_h = df_func.loc[df_func['nome'] == nova_funcao, 'valor_hora'].values[0]
-                        novo_total = duracao * val_h
-                        novo_periodo = calcular_periodo(novo_h_ini)
-                        atualizar_atendimento_db(id_selecionado, dt_ini, dt_fim, nova_funcao, novo_total, novos_detalhes, novo_paciente, novo_periodo)
-                        st.success("Registro atualizado com sucesso!")
-                        st.rerun()
+                        dt_ini = datetime.combine(novo_d_ini, novo_h_ini)
+                        dt_fim = datetime.combine(novo_d_fim, novo_h_fim)
+                        if dt_fim <= dt_ini: st.error("Erro: Data fim menor que início.")
+                        else:
+                            duracao = (dt_fim - dt_ini).total_seconds() / 3600
+                            val_h = df_func.loc[df_func['nome'] == nova_funcao, 'valor_hora'].values[0]
+                            novo_total = duracao * val_h
+                            novo_periodo = calcular_periodo(novo_h_ini)
+                            atualizar_atendimento_db(id_selecionado, dt_ini, dt_fim, nova_funcao, novo_total, novos_detalhes, novo_paciente, novo_periodo)
+                            st.success("Registro atualizado com sucesso!")
+                            st.rerun()
 
                 st.markdown("---")
                 with st.expander("🗑️ Área de Perigo (Excluir Registro)"):
