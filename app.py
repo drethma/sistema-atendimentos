@@ -1,10 +1,10 @@
 import streamlit as st
 import pandas as pd
-import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime
 import io
 import hashlib
 from fpdf import FPDF
+from supabase import create_client, Client
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(
@@ -12,6 +12,16 @@ st.set_page_config(
     page_icon="💼", 
     layout="wide"
 )
+
+# --- CONEXÃO SUPABASE ---
+# O Streamlit busca automaticamente as credenciais em .streamlit/secrets.toml ou na nuvem
+@st.cache_resource
+def init_connection():
+    url = st.secrets["supabase"]["url"]
+    key = st.secrets["supabase"]["key"]
+    return create_client(url, key)
+
+supabase = init_connection()
 
 # --- ESTILIZAÇÃO ---
 st.markdown("""
@@ -41,57 +51,6 @@ def check_hashes(password, hashed_text):
     if make_hashes(password) == hashed_text:
         return True
     return False
-
-# --- BANCO DE DADOS ---
-def init_db():
-    conn = sqlite3.connect('atendimentos.db')
-    c = conn.cursor()
-    
-    # Tabela Usuários
-    c.execute('''CREATE TABLE IF NOT EXISTS usuarios 
-                 (username TEXT PRIMARY KEY, password TEXT, tipo TEXT)''')
-    c.execute('SELECT count(*) FROM usuarios')
-    if c.fetchone()[0] == 0:
-        c.execute('INSERT INTO usuarios VALUES (?, ?, ?)', ('admin', make_hashes('admin123'), 'admin'))
-    
-    # Tabela Funções (AGORA COM DONO)
-    c.execute('''CREATE TABLE IF NOT EXISTS funcoes 
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT, nome TEXT, valor_hora REAL, usuario_criador TEXT)''')
-    
-    # Tabela Atendimentos
-    c.execute('''CREATE TABLE IF NOT EXISTS atendimentos 
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT, inicio TEXT, termino TEXT, 
-                  funcao TEXT, valor_total REAL, usuario_responsavel TEXT, detalhes TEXT,
-                  paciente TEXT, periodo TEXT)''')
-    conn.commit()
-    conn.close()
-    
-    atualizar_banco_legado()
-
-def atualizar_banco_legado():
-    conn = sqlite3.connect('atendimentos.db')
-    c = conn.cursor()
-    
-    # Atualiza Atendimentos
-    colunas_novas_atend = {'usuario_responsavel': 'TEXT', 'detalhes': 'TEXT', 'paciente': 'TEXT', 'periodo': 'TEXT'}
-    for col, tipo in colunas_novas_atend.items():
-        try: pd.read_sql(f'SELECT {col} FROM atendimentos LIMIT 1', conn)
-        except: 
-            try: c.execute(f'ALTER TABLE atendimentos ADD COLUMN {col} {tipo}'); conn.commit()
-            except: pass
-            
-    # Atualiza Funções (Adiciona dono para funções antigas)
-    try:
-        pd.read_sql('SELECT usuario_criador FROM funcoes LIMIT 1', conn)
-    except:
-        try: 
-            # Cria a coluna e define 'admin' como dono das funções antigas para não sumirem
-            c.execute('ALTER TABLE funcoes ADD COLUMN usuario_criador TEXT')
-            c.execute("UPDATE funcoes SET usuario_criador = 'admin' WHERE usuario_criador IS NULL")
-            conn.commit()
-        except: pass
-
-    conn.close()
 
 # --- LÓGICA DE PERÍODO ---
 def calcular_periodo(hora_inicio):
@@ -166,122 +125,115 @@ def criar_pdf_relatorio(df, mes_nome, ano, metricas, usuario, filtro_funcao):
         
     return pdf.output(dest='S').encode('latin-1')
 
-# --- CRUD BANCO DE DADOS ---
+# --- CRUD SUPABASE (SUBSTITUI O SQLITE) ---
+
 def login_user(username, password):
-    conn = sqlite3.connect('atendimentos.db')
-    c = conn.cursor()
-    c.execute('SELECT * FROM usuarios WHERE username = ?', (username,))
-    data = c.fetchall()
-    conn.close()
-    if data and check_hashes(password, data[0][1]): return data[0][2]
-    return False
+    try:
+        response = supabase.table('usuarios').select("*").eq('username', username).execute()
+        data = response.data
+        if data and check_hashes(password, data[0]['password']):
+            return data[0]['tipo']
+        return False
+    except Exception as e:
+        return False
 
 def criar_usuario(username, password, tipo):
     try:
-        conn = sqlite3.connect('atendimentos.db')
-        c = conn.cursor()
-        c.execute('INSERT INTO usuarios VALUES (?, ?, ?)', (username, make_hashes(password), tipo))
-        conn.commit(); conn.close()
+        data = {"username": username, "password": make_hashes(password), "tipo": tipo}
+        supabase.table('usuarios').insert(data).execute()
         return True
-    except: return False
+    except:
+        return False
 
 def listar_usuarios():
-    conn = sqlite3.connect('atendimentos.db')
-    df = pd.read_sql('SELECT username, tipo FROM usuarios', conn)
-    conn.close()
-    return df
+    try:
+        response = supabase.table('usuarios').select("*").execute()
+        return pd.DataFrame(response.data)
+    except:
+        return pd.DataFrame()
 
 def excluir_usuario(username):
-    conn = sqlite3.connect('atendimentos.db')
-    c = conn.cursor()
-    c.execute('DELETE FROM usuarios WHERE username = ?', (username,))
-    conn.commit(); conn.close()
+    supabase.table('usuarios').delete().eq('username', username).execute()
 
-# --- MODIFICADO: CARREGAR FUNÇÕES AGORA FILTRA POR DONO ---
+# --- FUNÇÕES ---
 def carregar_funcoes():
-    conn = sqlite3.connect('atendimentos.db')
     try:
         if st.session_state.get('tipo') == 'admin':
-            query = 'SELECT * FROM funcoes'
-            df = pd.read_sql(query, conn)
+            response = supabase.table('funcoes').select("*").execute()
         else:
-            # Usuário comum só vê as suas próprias funções
-            query = 'SELECT * FROM funcoes WHERE usuario_criador = ?'
-            df = pd.read_sql(query, conn, params=(st.session_state.get('usuario'),))
-    except: df = pd.DataFrame()
-    finally: conn.close()
-    
-    if 'usuario_criador' not in df.columns and not df.empty:
-        df['usuario_criador'] = 'admin'
+            response = supabase.table('funcoes').select("*").eq('usuario_criador', st.session_state.get('usuario')).execute()
         
-    return df
+        df = pd.DataFrame(response.data)
+        if 'usuario_criador' not in df.columns and not df.empty:
+            df['usuario_criador'] = 'admin'
+        return df
+    except:
+        return pd.DataFrame()
 
-# --- MODIFICADO: SALVAR FUNÇÃO COM O DONO ---
 def salvar_funcao(nome, valor, usuario_criador):
-    conn = sqlite3.connect('atendimentos.db')
-    c = conn.cursor()
-    c.execute('INSERT INTO funcoes (nome, valor_hora, usuario_criador) VALUES (?, ?, ?)', (nome, valor, usuario_criador))
-    conn.commit(); conn.close()
+    data = {"nome": nome, "valor_hora": valor, "usuario_criador": usuario_criador}
+    supabase.table('funcoes').insert(data).execute()
 
 def atualizar_funcao_db(id_func, nome, valor):
-    conn = sqlite3.connect('atendimentos.db')
-    c = conn.cursor()
-    c.execute('UPDATE funcoes SET nome=?, valor_hora=? WHERE id=?', (nome, valor, id_func))
-    conn.commit(); conn.close()
+    supabase.table('funcoes').update({"nome": nome, "valor_hora": valor}).eq('id', id_func).execute()
 
 def excluir_funcao_db(id_func):
-    conn = sqlite3.connect('atendimentos.db')
-    c = conn.cursor()
-    c.execute('DELETE FROM funcoes WHERE id=?', (id_func,))
-    conn.commit(); conn.close()
+    supabase.table('funcoes').delete().eq('id', id_func).execute()
 
+# --- ATENDIMENTOS ---
 def salvar_atendimento(inicio, termino, funcao, valor_total, usuario, detalhes, paciente, periodo):
-    conn = sqlite3.connect('atendimentos.db')
-    c = conn.cursor()
-    c.execute('''INSERT INTO atendimentos (inicio, termino, funcao, valor_total, usuario_responsavel, detalhes, paciente, periodo) 
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)''', (inicio, termino, funcao, valor_total, usuario, detalhes, paciente, periodo))
-    conn.commit(); conn.close()
+    data = {
+        "inicio": inicio.isoformat(),
+        "termino": termino.isoformat(),
+        "funcao": funcao,
+        "valor_total": valor_total,
+        "usuario_responsavel": usuario,
+        "detalhes": detalhes,
+        "paciente": paciente,
+        "periodo": periodo
+    }
+    supabase.table('atendimentos').insert(data).execute()
 
 def atualizar_atendimento_db(id_atend, inicio, termino, funcao, valor_total, detalhes, paciente, periodo):
-    conn = sqlite3.connect('atendimentos.db')
-    c = conn.cursor()
-    c.execute('''UPDATE atendimentos 
-                 SET inicio=?, termino=?, funcao=?, valor_total=?, detalhes=?, paciente=?, periodo=?
-                 WHERE id=?''', 
-              (inicio, termino, funcao, valor_total, detalhes, paciente, periodo, id_atend))
-    conn.commit(); conn.close()
+    data = {
+        "inicio": inicio.isoformat(),
+        "termino": termino.isoformat(),
+        "funcao": funcao,
+        "valor_total": valor_total,
+        "detalhes": detalhes,
+        "paciente": paciente,
+        "periodo": periodo
+    }
+    supabase.table('atendimentos').update(data).eq('id', id_atend).execute()
 
 def excluir_atendimento_db(id_atend):
-    conn = sqlite3.connect('atendimentos.db')
-    c = conn.cursor()
-    c.execute('DELETE FROM atendimentos WHERE id=?', (id_atend,))
-    conn.commit(); conn.close()
+    supabase.table('atendimentos').delete().eq('id', id_atend).execute()
 
 def carregar_atendimentos():
-    conn = sqlite3.connect('atendimentos.db')
     try:
         if st.session_state.get('tipo') == 'admin':
-            query = 'SELECT * FROM atendimentos'
-            df = pd.read_sql(query, conn)
+            response = supabase.table('atendimentos').select("*").execute()
         else:
-            query = 'SELECT * FROM atendimentos WHERE usuario_responsavel = ?'
-            df = pd.read_sql(query, conn, params=(st.session_state.get('usuario'),))
-    except Exception as e:
-        df = pd.DataFrame()
-    finally:
-        conn.close()
-    
-    if not df.empty:
-        df['inicio'] = pd.to_datetime(df['inicio'])
-        df['termino'] = pd.to_datetime(df['termino'])
-        for col in ['usuario_responsavel', 'detalhes', 'paciente', 'periodo']:
-            if col not in df.columns: df[col] = ''
-            df[col] = df[col].fillna('')
+            response = supabase.table('atendimentos').select("*").eq('usuario_responsavel', st.session_state.get('usuario')).execute()
+        
+        df = pd.DataFrame(response.data)
+        
+        if not df.empty:
+            # Converte as strings de data do Supabase (ISO) para datetime do Pandas
+            df['inicio'] = pd.to_datetime(df['inicio'])
+            df['termino'] = pd.to_datetime(df['termino'])
             
-    return df
+            # Ajuste de timezone se necessário (remove timezone info para evitar erros no Excel/PDF simples)
+            df['inicio'] = df['inicio'].dt.tz_localize(None)
+            df['termino'] = df['termino'].dt.tz_localize(None)
 
-# Inicializa
-init_db()
+            for col in ['usuario_responsavel', 'detalhes', 'paciente', 'periodo']:
+                if col not in df.columns: df[col] = ''
+                df[col] = df[col].fillna('')
+                
+        return df
+    except Exception as e:
+        return pd.DataFrame()
 
 # --- SESSÃO ---
 if 'logado' not in st.session_state:
@@ -326,11 +278,10 @@ else:
         st.session_state.update({'logado': False, 'usuario': None, 'tipo': None})
         st.rerun()
 
-    # TELA 01: FUNÇÕES (AGORA COM PRIVACIDADE)
+    # TELA 01: FUNÇÕES
     if menu == opcoes_menu["Funções"]:
         st.title("🛠️ Cadastro de Funções")
         
-        # Mostra aviso se não houver funções
         df_verificacao = carregar_funcoes()
         if df_verificacao.empty:
             st.info("💡 Você ainda não tem funções cadastradas. Cadastre a primeira abaixo.")
@@ -345,14 +296,11 @@ else:
                     valor = c2.number_input("Valor Hora (R$)", min_value=0.0, format="%.2f")
                     if st.form_submit_button("💾 Salvar"):
                         if nome and valor > 0:
-                            # Passa o usuário logado como dono
                             salvar_funcao(nome, valor, st.session_state['usuario'])
                             st.success(f"✅ '{nome}' cadastrado para {st.session_state['usuario']}!")
             st.subheader("📋 Suas Funções Ativas")
-            # Recarrega para mostrar a nova
             df = carregar_funcoes()
             if not df.empty: 
-                # Oculta coluna ID e Dono para ficar mais limpo na visualização
                 st.dataframe(df[['nome', 'valor_hora']], hide_index=True, use_container_width=True)
 
         with tab2:
@@ -394,7 +342,6 @@ else:
     # TELA 02: ATENDIMENTO
     elif menu == opcoes_menu["Atendimento"]:
         st.title("📝 Registrar Atendimento")
-        # Carrega APENAS as funções do usuário logado (ou todas se for admin)
         df_func = carregar_funcoes()
         
         if df_func.empty:
@@ -422,7 +369,6 @@ else:
                     elif dt_fim <= dt_ini: st.error("❌ Erro: Término deve ser depois do início.")
                     else:
                         duracao = (dt_fim - dt_ini).total_seconds() / 3600
-                        # Busca o valor da hora especificamente para a função selecionada
                         val_h = df_func.loc[df_func['nome'] == func, 'valor_hora'].values[0]
                         total = duracao * val_h
                         salvar_atendimento(dt_ini, dt_fim, func, total, st.session_state['usuario'], detalhes, nome_paciente, periodo_auto)
@@ -468,29 +414,22 @@ else:
                     
                     novo_paciente = st.text_input("Paciente", value=row['paciente'])
                     
-                    # Carrega as funções do usuário para o selectbox de edição
                     lista_funcoes = df_func['nome'].tolist()
-                    
-                    # Tenta achar a função atual na lista. Se não achar (ex: foi excluída ou era de outro user), pega a primeira.
                     try: index_funcao = lista_funcoes.index(row['funcao'])
                     except: 
                         index_funcao = 0
-                        # Se a lista estiver vazia (user sem funções), avisa
-                        if not lista_funcoes:
-                            st.error("Você precisa ter funções cadastradas para editar.")
+                        if not lista_funcoes: st.error("Você precisa ter funções cadastradas.")
                     
                     if lista_funcoes:
                         nova_funcao = st.selectbox("Função", lista_funcoes, index=index_funcao)
-                    else:
-                        nova_funcao = None
+                    else: nova_funcao = None
 
                     novos_detalhes = st.text_area("Detalhes", value=row['detalhes'])
                     
                     btn_save = st.form_submit_button("💾 Salvar Alterações")
                 
                 if btn_save:
-                    if not nova_funcao:
-                        st.error("Impossível salvar sem uma função válida.")
+                    if not nova_funcao: st.error("Impossível salvar sem uma função válida.")
                     else:
                         dt_ini = datetime.combine(novo_d_ini, novo_h_ini)
                         dt_fim = datetime.combine(novo_d_fim, novo_h_fim)
@@ -582,8 +521,10 @@ else:
                         if criar_usuario(u, p, t): st.success("✅ Criado!")
                         else: st.error("❌ Erro.")
         st.subheader("👥 Usuários")
-        for i, row in listar_usuarios().iterrows():
-            c1, c2, c3 = st.columns([3, 2, 1])
-            c1.markdown(f"👤 **{row['username']}**"); c2.caption(f"Tipo: {row['tipo']}")
-            if row['username'] != 'admin':
-                if c3.button("🗑️", key=f"del_{row['username']}"): excluir_usuario(row['username']); st.rerun()
+        df_users = listar_usuarios()
+        if not df_users.empty:
+            for i, row in df_users.iterrows():
+                c1, c2, c3 = st.columns([3, 2, 1])
+                c1.markdown(f"👤 **{row['username']}**"); c2.caption(f"Tipo: {row['tipo']}")
+                if row['username'] != 'admin':
+                    if c3.button("🗑️", key=f"del_{row['username']}"): excluir_usuario(row['username']); st.rerun()
